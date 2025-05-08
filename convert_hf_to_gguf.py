@@ -74,6 +74,12 @@ class ModelBase:
     dir_model_card: Path
     remote_hf_model_id: str | None
 
+    # Expert quantization attributes
+    expert_activation_data: list[list[float]] | None = None
+    expert_max_qtype: gguf.GGMLQuantizationType | None = None
+    expert_min_qtype: gguf.GGMLQuantizationType | None = None
+    expert_activation_threshold: float | None = None
+
     # subclasses should define this!
     model_arch: gguf.MODEL_ARCH
 
@@ -85,7 +91,8 @@ class ModelBase:
                  use_temp_file: bool = False, eager: bool = False,
                  metadata_override: Path | None = None, model_name: str | None = None,
                  split_max_tensors: int = 0, split_max_size: int = 0, dry_run: bool = False,
-                 small_first_shard: bool = False, hparams: dict[str, Any] | None = None, remote_hf_model_id: str | None = None):
+                 small_first_shard: bool = False, hparams: dict[str, Any] | None = None, remote_hf_model_id: str | None = None,
+                 expert_activations_path: Path | None = None, expert_max_bits_type: str | None = None, expert_min_bits_type: str | None = None, expert_activation_threshold: float | None = None):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is VisionModel:
@@ -120,6 +127,46 @@ class ModelBase:
         self.metadata_override = metadata_override
         self.model_name = model_name
         self.dir_model_card = dir_model  # overridden in convert_lora_to_gguf.py
+
+        # Initialize expert quantization parameters
+        self.expert_activation_threshold = expert_activation_threshold
+        if expert_activations_path is not None:
+            if not expert_max_bits_type or not expert_min_bits_type or expert_activation_threshold is None:
+                # These should have been caught by argparse if defaults were not set, but as a safeguard:
+                raise ValueError("Expert activation file provided, but max/min bits type or threshold is missing.")
+            try:
+                with open(expert_activations_path, 'r', encoding='utf-8') as f:
+                    self.expert_activation_data = json.load(f)
+                logger.info(f"Loaded expert activation data from {expert_activations_path}")
+
+                # Convert string qtype names to enum members
+                try:
+                    self.expert_max_qtype = gguf.GGMLQuantizationType[expert_max_bits_type]
+                    logger.info(f"Expert max bits type: {self.expert_max_qtype.name}")
+                except KeyError:
+                    logger.error(f"Invalid GGUF quantization type for expert-max-bits-type: {expert_max_bits_type}")
+                    raise
+                try:
+                    self.expert_min_qtype = gguf.GGMLQuantizationType[expert_min_bits_type]
+                    logger.info(f"Expert min bits type: {self.expert_min_qtype.name}")
+                except KeyError:
+                    logger.error(f"Invalid GGUF quantization type for expert-min-bits-type: {expert_min_bits_type}")
+                    raise
+                logger.info(f"Expert activation threshold: {self.expert_activation_threshold}")
+                logger.info("Dynamic expert quantization is active.")
+            except FileNotFoundError:
+                logger.error(f"Expert activation file not found: {expert_activations_path}")
+                raise
+            except json.JSONDecodeError:
+                logger.error(f"Error decoding JSON from expert activation file: {expert_activations_path}")
+                raise
+            except Exception as e:
+                logger.error(f"Error processing expert activation parameters: {e}")
+                raise
+        elif expert_max_bits_type != "Q4_K_M" or expert_min_bits_type != "Q1_0" or expert_activation_threshold != 0.10:
+            # If any non-default expert quant args are given without the main activation file path
+            logger.warning("Expert quantization parameters (--expert-max-bits-type, etc.) provided without --expert-activations file. They will be ignored.")
+
 
         # Apply heuristics to figure out typical tensor encoding based on first layer tensor encoding type
         if self.ftype == gguf.LlamaFileType.GUESSED:
@@ -245,7 +292,66 @@ class ModelBase:
         return [(self.map_tensor_name(name), data_torch)]
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
-        del name, new_name, bid, n_dims  # unused
+        # name: original HF tensor name, e.g., "model.layers.0.mlp.experts.99.up_proj.weight"
+        # bid: layer index derived earlier from name, should be reliable.
+
+        if (self.expert_activation_data and
+            self.expert_max_qtype is not None and
+            self.expert_min_qtype is not None and
+            self.expert_activation_threshold is not None):
+
+            is_expert_part_in_hf_name = False
+            parsed_layer_idx_hf = -1
+            parsed_expert_idx_hf = -1
+
+            # Use the regex to parse layer and expert index from the original HF 'name'
+            match_hf_expert = re.search(r'model\.layers\.(\d+)\..*?\.experts\.(\d+)\..*?\.weight', name)
+
+            if match_hf_expert:
+                is_expert_part_in_hf_name = True
+                parsed_layer_idx_hf = int(match_hf_expert.group(1))
+                parsed_expert_idx_hf = int(match_hf_expert.group(2))
+
+                # Validate passed bid against parsed layer index from name
+                if bid is None:
+                    bid = parsed_layer_idx_hf # Use parsed if bid wasn't available
+                    logger.debug(f"Using layer index {bid} parsed from HF expert name {name}")
+                elif bid != parsed_layer_idx_hf:
+                    logger.warning(f"Layer index mismatch for expert tensor {name}: passed bid={bid}, parsed from HF name={parsed_layer_idx_hf}. Prioritizing passed bid={bid}.")
+                    # Stick with the originally passed bid if there's a mismatch, as it's derived earlier.
+
+            is_stacked_gguf_expert_name = (".experts." in new_name or ".exps." in new_name) and ".weight" in new_name
+
+            # Apply individual expert quantization logic
+            if is_expert_part_in_hf_name and bid is not None and parsed_expert_idx_hf != -1:
+                expert_idx_to_use = parsed_expert_idx_hf
+                try:
+                    # Boundary checks
+                    if not (0 <= bid < len(self.expert_activation_data)):
+                        logger.warning(f"Layer index {bid} (for expert part {name} -> {new_name}) out of bounds for expert_activation_data (size {len(self.expert_activation_data)}). Falling back.")
+                        return False
+                    layer_expert_probs = self.expert_activation_data[bid]
+                    if not (0 <= expert_idx_to_use < len(layer_expert_probs)):
+                        logger.warning(f"Expert index {expert_idx_to_use} (from HF name {name}) for tensor {new_name} (layer {bid}) out of bounds for layer_expert_probs (size {len(layer_expert_probs)}). Falling back.")
+                        return False
+
+                    # Probability lookup and decision
+                    activation_prob = layer_expert_probs[expert_idx_to_use]
+                    # logger.debug(f"HF_NAME: {name}, GGUF_NAME: {new_name}, LAYER: {bid}, EXPERT_HF_IDX: {expert_idx_to_use}, PROB: {activation_prob}")
+                    if activation_prob >= self.expert_activation_threshold:
+                        logger.debug(f"Expert part {name} -> {new_name} (L{bid}, E{expert_idx_to_use}) prob {activation_prob:.4f} >= thresh {self.expert_activation_threshold:.2f}. Quantizing to {self.expert_max_qtype.name}")
+                        return self.expert_max_qtype
+                    else:
+                        logger.debug(f"Expert part {name} -> {new_name} (L{bid}, E{expert_idx_to_use}) prob {activation_prob:.4f} < thresh {self.expert_activation_threshold:.2f}. Quantizing to {self.expert_min_qtype.name}")
+                        return self.expert_min_qtype
+                except (IndexError, TypeError, ValueError) as e:
+                    logger.warning(f"Error ({type(e).__name__}) processing expert part {name} -> {new_name} (L{bid}, E{expert_idx_to_use}). Details: {e}. Fallback.")
+                    return False # Fallback on error
+
+            # Apply max quant type to non-expert layer-specific tensors
+            elif not is_expert_part_in_hf_name and bid is not None and not is_stacked_gguf_expert_name and not new_name.endswith("_norm.weight"): # <-- Added check
+                logger.debug(f"Non-expert, non-norm layer tensor {new_name} (layer {bid}) under dynamic quant rules. Quantizing to {self.expert_max_qtype.name}")
+                return self.expert_max_qtype
 
         return False
 
@@ -286,14 +392,20 @@ class ModelBase:
                 n_dims = len(data.shape)
                 data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
 
-                # Most of the codebase that takes in 1D tensors or norms only handles F32 tensors
-                if n_dims <= 1 or new_name.endswith("_norm.weight"):
-                    data_qtype = gguf.GGMLQuantizationType.F32
+                final_data_qtype: gguf.GGMLQuantizationType
 
-                # Conditions should closely match those in llama_model_quantize_internal in llama.cpp
-                # Some tensor types are always in float32
-                if data_qtype is False and (
-                    any(
+                if isinstance(data_qtype, gguf.GGMLQuantizationType):
+                    # tensor_force_quant made a specific decision, use it.
+                    final_data_qtype = data_qtype
+                else:
+                    # tensor_force_quant returned False. Apply default rules.
+                    default_qtype_decision: gguf.GGMLQuantizationType | bool = False # Default to no specific quant type yet
+
+                    # Rule 1: Norms and 1D tensors to F32 (original logic)
+                    if n_dims <= 1 or new_name.endswith("_norm.weight"):
+                        default_qtype_decision = gguf.GGMLQuantizationType.F32
+                    # Rule 2: Specific tensor names to F32 (original logic)
+                    elif any(
                         self.match_model_tensor_name(new_name, key, bid)
                         for key in (
                             gguf.MODEL_TENSOR.FFN_GATE_INP,
@@ -309,58 +421,57 @@ class ModelBase:
                             gguf.MODEL_TENSOR.POSNET_NORM1,
                             gguf.MODEL_TENSOR.POSNET_NORM2,
                         )
-                    )
-                    or not new_name.endswith(".weight")
-                ):
-                    data_qtype = gguf.GGMLQuantizationType.F32
-
-                if data_qtype is False and any(
-                    self.match_model_tensor_name(new_name, key, bid)
-                    for key in (
-                        gguf.MODEL_TENSOR.TOKEN_EMBD,
-                        gguf.MODEL_TENSOR.OUTPUT,
-                    )
-                ):
-                    if self.ftype in (
-                        gguf.LlamaFileType.MOSTLY_TQ1_0,
-                        gguf.LlamaFileType.MOSTLY_TQ2_0,
+                    ) or not new_name.endswith(".weight"):
+                        default_qtype_decision = gguf.GGMLQuantizationType.F32
+                    # Rule 3: Token embeddings/output to F16 for ternary types (original logic)
+                    elif any(
+                        self.match_model_tensor_name(new_name, key, bid)
+                        for key in (
+                            gguf.MODEL_TENSOR.TOKEN_EMBD,
+                            gguf.MODEL_TENSOR.OUTPUT,
+                        )
                     ):
-                        # TODO: use Q4_K and Q6_K
-                        data_qtype = gguf.GGMLQuantizationType.F16
+                        if self.ftype in (
+                            gguf.LlamaFileType.MOSTLY_TQ1_0,
+                            gguf.LlamaFileType.MOSTLY_TQ2_0,
+                        ):
+                            default_qtype_decision = gguf.GGMLQuantizationType.F16
+                        # else, they will be handled by the general ftype matching below if default_qtype_decision remains False
 
-                # No override (data_qtype is False), or wants to be quantized (data_qtype is True)
-                if isinstance(data_qtype, bool):
-                    if self.ftype == gguf.LlamaFileType.ALL_F32:
-                        data_qtype = gguf.GGMLQuantizationType.F32
-                    elif self.ftype == gguf.LlamaFileType.MOSTLY_F16:
-                        data_qtype = gguf.GGMLQuantizationType.F16
-                    elif self.ftype == gguf.LlamaFileType.MOSTLY_BF16:
-                        data_qtype = gguf.GGMLQuantizationType.BF16
-                    elif self.ftype == gguf.LlamaFileType.MOSTLY_Q8_0:
-                        data_qtype = gguf.GGMLQuantizationType.Q8_0
-                    elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ1_0:
-                        data_qtype = gguf.GGMLQuantizationType.TQ1_0
-                    elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ2_0:
-                        data_qtype = gguf.GGMLQuantizationType.TQ2_0
-                    else:
-                        raise ValueError(f"Unknown file type: {self.ftype.name}")
+                    # If none of the specific rules above applied, use the general ftype.
+                    if default_qtype_decision is False:
+                        if self.ftype == gguf.LlamaFileType.ALL_F32:
+                            default_qtype_decision = gguf.GGMLQuantizationType.F32
+                        elif self.ftype == gguf.LlamaFileType.MOSTLY_F16:
+                            default_qtype_decision = gguf.GGMLQuantizationType.F16
+                        elif self.ftype == gguf.LlamaFileType.MOSTLY_BF16:
+                            default_qtype_decision = gguf.GGMLQuantizationType.BF16
+                        elif self.ftype == gguf.LlamaFileType.MOSTLY_Q8_0:
+                            default_qtype_decision = gguf.GGMLQuantizationType.Q8_0
+                        elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ1_0:
+                            default_qtype_decision = gguf.GGMLQuantizationType.TQ1_0
+                        elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ2_0:
+                            default_qtype_decision = gguf.GGMLQuantizationType.TQ2_0
+                        else:
+                            raise ValueError(f"Unknown file type for default quantization: {self.ftype.name}")
+                    final_data_qtype = default_qtype_decision
 
                 try:
-                    data = gguf.quants.quantize(data, data_qtype)
+                    data = gguf.quants.quantize(data, final_data_qtype)
                 except gguf.QuantError as e:
                     logger.warning("%s, %s", e, "falling back to F16")
-                    data_qtype = gguf.GGMLQuantizationType.F16
-                    data = gguf.quants.quantize(data, data_qtype)
+                    final_data_qtype = gguf.GGMLQuantizationType.F16
+                    data = gguf.quants.quantize(data, final_data_qtype)
 
-                shape = gguf.quant_shape_from_byte_shape(data.shape, data_qtype) if data.dtype == np.uint8 else data.shape
+                shape = gguf.quant_shape_from_byte_shape(data.shape, final_data_qtype) if data.dtype == np.uint8 else data.shape
 
                 # reverse shape to make it similar to the internal ggml dimension order
                 shape_str = f"{{{', '.join(str(n) for n in reversed(shape))}}}"
 
                 # n_dims is implicit in the shape
-                logger.info(f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype} --> {data_qtype.name}, shape = {shape_str}")
+                logger.info(f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype} --> {final_data_qtype.name}, shape = {shape_str}")
 
-                self.gguf_writer.add_tensor(new_name, data, raw_dtype=data_qtype)
+                self.gguf_writer.add_tensor(new_name, data, raw_dtype=final_data_qtype)
 
     def set_type(self):
         self.gguf_writer.add_type(gguf.GGUFType.MODEL)
@@ -5748,44 +5859,16 @@ class BailingMoeModel(TextModel):
                 (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_K, bid), BailingMoeModel.permute(k, n_head, n_kv_head)),
                 (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_V, bid), v)
             ]
-        elif name.find("mlp.experts") != -1:
-            n_experts = self.hparams["num_experts"]
-            assert bid is not None
+        elif name.endswith(("q_proj.weight", "q_proj.bias")):
+            data_torch = LlamaModel.permute(data_torch, n_head, n_head)
+        elif name.endswith(("k_proj.weight", "k_proj.bias")):
+            data_torch = LlamaModel.permute(data_torch, n_head, n_kv_head)
+        elif name.endswith(("q_norm.weight", "q_norm.bias")):
+            data_torch = ChameleonModel._reverse_hf_permute(data_torch, n_head, n_embd)
+        elif name.endswith(("k_norm.weight", "k_norm.bias")):
+            data_torch = ChameleonModel._reverse_hf_permute(data_torch, n_kv_head, n_embd)
 
-            tensors: list[tuple[str, Tensor]] = []
-
-            if self._experts is None:
-                self._experts = [{} for _ in range(self.block_count)]
-
-            self._experts[bid][name] = data_torch
-
-            if len(self._experts[bid]) >= n_experts * 3:
-                # merge the experts into a single 3d tensor
-                for w_name in ["down_proj", "gate_proj", "up_proj"]:
-                    datas: list[Tensor] = []
-
-                    for xid in range(n_experts):
-                        ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
-                        datas.append(self._experts[bid][ename])
-                        del self._experts[bid][ename]
-
-                    data_torch = torch.stack(datas, dim=0)
-
-                    merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
-
-                    new_name = self.map_tensor_name(merged_name)
-
-                    tensors.append((new_name, data_torch))
-
-            return tensors
-
-        new_name = self.map_tensor_name(name)
-
-        if new_name == output_name and self.hparams.get("norm_head"):
-            data_torch = data_torch.float()
-            data_torch /= torch.norm(data_torch, p=2, dim=0, keepdim=True) + 1e-7
-
-        return [(new_name, data_torch)]
+        return [(self.map_tensor_name(name), data_torch)]
 
     def prepare_tensors(self):
         super().prepare_tensors()
@@ -5919,6 +6002,7 @@ class LazyTorchTensor(gguf.LazyBase):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert a huggingface model to a GGML compatible file")
+    expert_quant_group = parser.add_argument_group('Dynamic Expert Quantization')
     parser.add_argument(
         "--vocab-only", action="store_true",
         help="extract only the vocab",
@@ -5987,6 +6071,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mmproj", action="store_true",
         help="(Experimental) Export multimodal projector (mmproj) for vision models. This will only work on some vision models. A prefix 'mmproj-' will be added to the output file name.",
+    )
+    expert_quant_group.add_argument(
+        "--expert-activations", type=Path, default=None,
+        help="Path to a JSON file containing expert activation probabilities (2D list: [layer][expert])"
+    )
+    expert_quant_group.add_argument(
+        "--expert-max-bits-type", type=str, default="Q4_K_M",
+        choices=[qtype.name for qtype in gguf.GGMLQuantizationType],
+        help="GGUF quantization type for experts above the activation threshold (default: Q4_K_M)"
+    )
+    expert_quant_group.add_argument(
+        "--expert-min-bits-type", type=str, default="Q1_0",
+        choices=[qtype.name for qtype in gguf.GGMLQuantizationType],
+        help="GGUF quantization type for experts at or below the activation threshold (default: Q1_0)"
+    )
+    expert_quant_group.add_argument(
+        "--expert-activation-threshold", type=float, default=0.10,
+        help="Activation probability threshold. Experts >= threshold use max bits, < use min bits (default: 0.10)"
     )
 
     args = parser.parse_args()
@@ -6100,7 +6202,11 @@ def main() -> None:
                                      split_max_tensors=args.split_max_tensors,
                                      split_max_size=split_str_to_n_bytes(args.split_max_size), dry_run=args.dry_run,
                                      small_first_shard=args.no_tensor_first_split,
-                                     remote_hf_model_id=str(args.model) if args.remote else None)
+                                     remote_hf_model_id=str(args.model) if args.remote else None,
+                                     expert_activations_path=args.expert_activations,
+                                     expert_max_bits_type=args.expert_max_bits_type,
+                                     expert_min_bits_type=args.expert_min_bits_type,
+                                     expert_activation_threshold=args.expert_activation_threshold)
 
         if args.vocab_only:
             logger.info("Exporting model vocab...")
