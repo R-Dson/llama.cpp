@@ -216,7 +216,6 @@ class ModelBase:
         else:
             self.tensor_names = tensor_names_from_parts
             weight_map = {}
-
         for part_name in self.part_names:
             logger.info(f"gguf: loading model part '{part_name}'")
             ctx: ContextManager[Any]
@@ -349,8 +348,9 @@ class ModelBase:
                     return False # Fallback on error
 
             # Apply max quant type to non-expert layer-specific tensors
-            elif not is_expert_part_in_hf_name and bid is not None and not is_stacked_gguf_expert_name and not new_name.endswith("_norm.weight"): # <-- Added check
+            elif not is_expert_part_in_hf_name and bid is not None and not is_stacked_gguf_expert_name and not new_name.endswith("_norm.weight"):
                 logger.debug(f"Non-expert, non-norm layer tensor {new_name} (layer {bid}) under dynamic quant rules. Quantizing to {self.expert_max_qtype.name}")
+                return False;
                 return self.expert_max_qtype
 
         return False
@@ -393,7 +393,6 @@ class ModelBase:
                 data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
 
                 final_data_qtype: gguf.GGMLQuantizationType
-
                 if isinstance(data_qtype, gguf.GGMLQuantizationType):
                     # tensor_force_quant made a specific decision, use it.
                     final_data_qtype = data_qtype
@@ -456,22 +455,87 @@ class ModelBase:
                             raise ValueError(f"Unknown file type for default quantization: {self.ftype.name}")
                     final_data_qtype = default_qtype_decision
 
-                try:
-                    data = gguf.quants.quantize(data, final_data_qtype)
-                except gguf.QuantError as e:
-                    logger.warning("%s, %s", e, "falling back to F16")
-                    final_data_qtype = gguf.GGMLQuantizationType.F16
-                    data = gguf.quants.quantize(data, final_data_qtype)
+                final_data_qtype = gguf.GGMLQuantizationType.BF16
+                
+                def quantize_with_fallback(data, qtype):
+                    """Simple helper to quantize with fallback to F16"""
+                    try:
+                        return gguf.quants.quantize(data, qtype), qtype
+                    except gguf.QuantError as e:
+                        logger.warning("%s, %s", e, "falling back to F16")
+                        fallback_qtype = gguf.GGMLQuantizationType.F16
+                        return gguf.quants.quantize(data, fallback_qtype), fallback_qtype
 
-                shape = gguf.quant_shape_from_byte_shape(data.shape, final_data_qtype) if data.dtype == np.uint8 else data.shape
+                if 'expert' in name:
+                    num_experts = data.shape[0]
+                    activations = np.array(self.expert_activation_data[bid][:num_experts])
+                    
+                    # Fast path: Check if all experts use the same quantization type
+                    all_above_threshold = np.all(activations >= self.expert_activation_threshold)
+                    all_below_threshold = np.all(activations < self.expert_activation_threshold)
+                    
+                    if all_above_threshold or all_below_threshold:
+                        # Batch processing - all experts use the same qtype
+                        uniform_qtype = self.expert_max_qtype if all_above_threshold else self.expert_min_qtype
+                        try:
+                            new_data, final_data_qtype = quantize_with_fallback(data, uniform_qtype)
+                        except Exception:
+                            # Fallback to individual processing if batch fails
+                            use_individual_processing = True
+                        else:
+                            use_individual_processing = False
+                    else:
+                        # Mixed quantization requirements - must process individually
+                        use_individual_processing = True
+                        
+                    # Individual expert processing if needed
+                    if use_individual_processing:
+                        quantized_experts = []
+                        for exp_i in range(num_experts):
+                            exp_act = activations[exp_i]
+                            original_expert_data = data[exp_i] # Clarify we're working with the specific expert's data
 
-                # reverse shape to make it similar to the internal ggml dimension order
-                shape_str = f"{{{', '.join(str(n) for n in reversed(shape))}}}"
+                            # Determine target quantization type for this expert
+                            exp_qtype = self.expert_max_qtype if exp_act >= self.expert_activation_threshold else self.expert_min_qtype
+                            # Quantize the data
+                            quantized_expert_data, actual_exp_qtype = quantize_with_fallback(original_expert_data, exp_qtype)
+                            quantized_experts.append(quantized_expert_data)
 
-                # n_dims is implicit in the shape
-                logger.info(f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype} --> {final_data_qtype.name}, shape = {shape_str}")
+                            # and not the raw byte size.
+                            quantized_shape = gguf.quant_shape_from_byte_shape(quantized_expert_data.shape, actual_exp_qtype)
 
-                self.gguf_writer.add_tensor(new_name, data, raw_dtype=final_data_qtype)
+                            # Format shape string (this is fine, f-strings are efficient)
+                            shape_str = f"{{{', '.join(str(n) for n in reversed(quantized_shape))}}}"
+
+                            # Construct tensor name
+                            tensor_name = f"{new_name}.{exp_i}"
+                            # logger.info(f"{f'%-{max_name_len}s' % f'{tensor_name},'} {old_dtype} --> {actual_exp_qtype.name}, shape = {shape_str}")
+
+                            # Add the *quantized* data with its *actual* quantization type
+                            self.gguf_writer.add_tensor(
+                                name=tensor_name,
+                                tensor=quantized_expert_data, # <- CRITICAL: Use the quantized data
+                                raw_dtype=actual_exp_qtype     # <- CRITICAL: Use the qtype of this specific tensor
+                            )
+                            logger.debug(f"Expert {exp_i}: {old_dtype} -> {final_data_qtype.name}, shape = {shape_str}")
+                else:
+                    if (name == 'blk.0.ffn_gate_exps.weight'):
+                        pass
+                    # Handle non-expert tensor
+                    new_data, final_data_qtype = quantize_with_fallback(data, final_data_qtype)
+
+                    # Use new_data as the quantized result
+                    data = new_data
+
+                    # Calculate shape based on data type
+                    shape = gguf.quant_shape_from_byte_shape(data.shape, final_data_qtype) if data.dtype == np.uint8 else data.shape
+
+                    # Format shape string
+                    shape_str = f"{{{', '.join(str(n) for n in reversed(shape))}}}"
+
+                    # Log and save tensor
+                    logger.info(f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype} --> {final_data_qtype.name}, shape = {shape_str}")
+                    self.gguf_writer.add_tensor(new_name, data, raw_dtype=final_data_qtype)
 
     def set_type(self):
         self.gguf_writer.add_type(gguf.GGUFType.MODEL)
